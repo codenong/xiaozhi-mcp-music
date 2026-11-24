@@ -129,7 +129,7 @@ async def _play_song(args: dict) -> dict:
             {"playing": False},
         )
 
-    verify = settings.local_player == "none"  # 本地播放时无需网络验证
+    verify = True  # 本地/设备端播放前同样验证链接可用性
     last_error = "未知错误"
     for song in candidates[: settings.max_resolve_tries]:
         try:
@@ -139,28 +139,50 @@ async def _play_song(args: dict) -> dict:
             if verify and not await _verify_url(play.url):
                 last_error = f"「{song.title}」的播放地址无法访问（可能已下架或需要会员）"
                 continue
-            structured = {
-                "playing": True,
-                "song": _song_public(song),
-                "play_url": play.url,
-                "mime_type": play.mime_type,
-                "source": song.source_name,
-            }
-            texts = [
-                compact_json(
-                    {
-                        "playing": True,
-                        "title": song.title,
-                        "artist": song.artist,
-                        "source": song.source_name,
-                        "message": f"正在播放：{song.title} - {song.artist}",
-                    }
-                )
-            ]
+            song_label = f"{song.title} - {song.artist}" if song.artist else song.title
             if settings.auto_play_local and player.available:
-                msg = player.play(play.url, f"{song.title} - {song.artist}")
-                texts.append(msg)
-                structured["local_player"] = msg
+                msg = player.play(play.url, song_label)
+                structured = {
+                    "playing": True,
+                    "song": _song_public(song),
+                    "play_url": play.url,
+                    "mime_type": play.mime_type,
+                    "source": song.source_name,
+                    "local_player": msg,
+                }
+                texts = [
+                    compact_json(
+                        {
+                            "playing": True,
+                            "title": song.title,
+                            "artist": song.artist,
+                            "source": song.source_name,
+                            "message": f"正在播放：{song_label}",
+                        }
+                    ),
+                    msg,
+                ]
+            else:
+                structured = {
+                    "playing": False,
+                    "resolved": True,
+                    "song": _song_public(song),
+                    "play_url": play.url,
+                    "mime_type": play.mime_type,
+                    "source": song.source_name,
+                }
+                texts = [
+                    compact_json(
+                        {
+                            "playing": False,
+                            "resolved": True,
+                            "title": song.title,
+                            "artist": song.artist,
+                            "play_url": play.url,
+                            "next_action": "请立即调用设备端工具 self.music.play_url(url=play_url, title=title) 开始播放",
+                        }
+                    )
+                ]
             return _tool_result(
                 texts,
                 structured,
@@ -320,7 +342,7 @@ def build_server() -> MCPServer:
     server.add_tool(
         "local_player_control",
         (
-            "控制本机媒体播放器（mpv/vlc）播放/停止，仅当 LOCAL_PLAYER 配置启用时有效。"
+            "控制本机媒体播放器（mpv/vlc/mplayer）播放/停止，仅当 LOCAL_PLAYER 配置启用时有效。"
             "用于电脑端本地播放场景；小智硬件播放走 play_song 的音频资源，不需要此工具。"
         ),
         {
