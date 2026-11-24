@@ -44,22 +44,23 @@ logger = logging.getLogger('MCP_PIPE')
 INITIAL_BACKOFF = 1  # Initial wait time in seconds
 MAX_BACKOFF = 600  # Maximum wait time in seconds
 
-async def connect_with_retry(uri, target):
+async def connect_with_retry(uri, target, log_label: str | None = None):
     """Connect to WebSocket server with retry mechanism for a given server target."""
+    label = log_label or target
     reconnect_attempt = 0
     backoff = INITIAL_BACKOFF
     while True:  # Infinite reconnection
         try:
             if reconnect_attempt > 0:
-                logger.info(f"[{target}] Waiting {backoff}s before reconnection attempt {reconnect_attempt}...")
+                logger.info(f"[{label}] Waiting {backoff}s before reconnection attempt {reconnect_attempt}...")
                 await asyncio.sleep(backoff)
 
             # Attempt to connect
-            await connect_to_server(uri, target)
+            await connect_to_server(uri, target, label)
 
         except Exception as e:
             reconnect_attempt += 1
-            logger.warning(f"[{target}] Connection closed (attempt {reconnect_attempt}): {e}")
+            logger.warning(f"[{label}] Connection closed (attempt {reconnect_attempt}): {e}")
             # Calculate wait time for next reconnection (exponential backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
 
@@ -79,8 +80,22 @@ async def run_pipe(endpoint_url: str, target: str | None = None):
     await _main(endpoint_url, target)
 
 
-async def _main(endpoint_url: str, target_arg: str | None = None):
+async def run_pipes(endpoints: list[dict[str, str]], target: str | None = None):
+    """供 bridge.py 调用：单进程同时连接多个小智智能体 WebSocket 接入点。"""
+    if not endpoints:
+        raise RuntimeError("No MCP endpoints configured")
+    tasks = [
+        asyncio.create_task(_main(ep["url"], target, label_prefix=ep.get("name", "")))
+        for ep in endpoints
+    ]
+    await asyncio.gather(*tasks)
+
+
+async def _main(endpoint_url: str, target_arg: str | None = None, label_prefix: str = ""):
     """运行全部配置服务，或运行单个本地脚本/服务。"""
+    def fmt_label(name: str) -> str:
+        return f"{label_prefix}/{name}" if label_prefix else name
+
     if not target_arg:
         cfg = load_config()
         servers_cfg = (cfg.get("mcpServers") or {})
@@ -91,25 +106,30 @@ async def _main(endpoint_url: str, target_arg: str | None = None):
             logger.info(f"Skipping disabled servers: {', '.join(skipped)}")
         if not enabled:
             raise RuntimeError("No enabled mcpServers found in config")
-        logger.info(f"Starting servers: {', '.join(enabled)}")
-        tasks = [asyncio.create_task(connect_with_retry(endpoint_url, t)) for t in enabled]
+        prefix_note = f" ({label_prefix})" if label_prefix else ""
+        logger.info(f"Starting servers{prefix_note}: {', '.join(enabled)}")
+        tasks = [
+            asyncio.create_task(connect_with_retry(endpoint_url, t, log_label=fmt_label(t)))
+            for t in enabled
+        ]
         # Run all forever; if any crashes it will auto-retry inside
         await asyncio.gather(*tasks)
     else:
         if os.path.exists(target_arg):
-            await connect_with_retry(endpoint_url, target_arg)
+            await connect_with_retry(endpoint_url, target_arg, log_label=fmt_label(target_arg))
         else:
             raise RuntimeError(
                 f"'{target_arg}' is neither a configured server nor an existing script"
             )
 
 
-async def connect_to_server(uri, target):
+async def connect_to_server(uri, target, log_label: str | None = None):
     """Connect to WebSocket server and pipe stdio for the given server target."""
+    label = log_label or target
     try:
-        logger.info(f"[{target}] Connecting to WebSocket server...")
+        logger.info(f"[{label}] Connecting to WebSocket server...")
         async with websockets.connect(uri) as websocket:
-            logger.info(f"[{target}] Successfully connected to WebSocket server")
+            logger.info(f"[{label}] Successfully connected to WebSocket server")
 
             # Start server process (built from CLI arg or config)
             cmd, env = build_server_command(target)
@@ -122,30 +142,30 @@ async def connect_to_server(uri, target):
                 text=True,
                 env=env
             )
-            logger.info(f"[{target}] Started server process: {' '.join(cmd)}")
+            logger.info(f"[{label}] Started server process: {' '.join(cmd)}")
             
             # Create two tasks: read from WebSocket and write to process, read from process and write to WebSocket
             await asyncio.gather(
-                pipe_websocket_to_process(websocket, process, target),
-                pipe_process_to_websocket(process, websocket, target),
-                pipe_process_stderr_to_terminal(process, target)
+                pipe_websocket_to_process(websocket, process, label),
+                pipe_process_to_websocket(process, websocket, label),
+                pipe_process_stderr_to_terminal(process, label)
             )
     except websockets.exceptions.ConnectionClosed as e:
-        logger.error(f"[{target}] WebSocket connection closed: {e}")
+        logger.error(f"[{label}] WebSocket connection closed: {e}")
         raise  # Re-throw exception to trigger reconnection
     except Exception as e:
-        logger.error(f"[{target}] Connection error: {e}")
+        logger.error(f"[{label}] Connection error: {e}")
         raise  # Re-throw exception
     finally:
         # Ensure the child process is properly terminated
         if 'process' in locals():
-            logger.info(f"[{target}] Terminating server process")
+            logger.info(f"[{label}] Terminating server process")
             try:
                 process.terminate()
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-            logger.info(f"[{target}] Server process terminated")
+            logger.info(f"[{label}] Server process terminated")
 
 async def pipe_websocket_to_process(websocket, process, target):
     """Read data from WebSocket and write to process stdin"""

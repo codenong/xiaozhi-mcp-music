@@ -36,28 +36,48 @@ logging.getLogger("websockets.server").setLevel(logging.WARNING)
 logger = logging.getLogger("bridge")
 
 
+def _load_endpoints(mcp_pipe) -> list[dict[str, str]]:
+    cfg = mcp_pipe.load_config()
+    raw = cfg.get("mcpEndpoints") or cfg.get("mcp_endpoints") or []
+    endpoints: list[dict[str, str]] = []
+    if isinstance(raw, list):
+        for idx, item in enumerate(raw, 1):
+            if isinstance(item, str) and item.strip():
+                endpoints.append({"name": f"agent{idx}", "url": item.strip()})
+            elif isinstance(item, dict):
+                url = str(item.get("url", "") or "").strip()
+                if url and not item.get("disabled"):
+                    name = str(item.get("name", "") or f"agent{idx}").strip()
+                    endpoints.append({"name": name, "url": url})
+    if not endpoints:
+        env_ep = (os.environ.get("MCP_ENDPOINT") or "").strip()
+        if env_ep:
+            endpoints.append({"name": "", "url": env_ep})
+    return endpoints
+
+
 def main() -> int:
     import mcp_pipe
 
-    endpoint = os.environ.get("MCP_ENDPOINT")
-    if not endpoint:
+    endpoints = _load_endpoints(mcp_pipe)
+    if not endpoints:
         print(
-            "未设置 MCP_ENDPOINT。\n"
-            "请登录小智控制台（如 xiaozhi.me），进入智能体配置角色页面，"
-            "复制该智能体专属的 MCP 接入点地址，然后写入 .env：\n"
-            "  MCP_ENDPOINT=wss://api.xiaozhi.me/mcp/?token=xxx\n"
-            "或复制 .env.example 为 .env 后填写。",
+            "未配置 MCP 接入点。\n"
+            "请在 mcp_config.json 中配置 mcpEndpoints 数组（推荐多智能体）：\n"
+            '  "mcpEndpoints": ["wss://api.xiaozhi.me/mcp/?token=xxx1", "wss://api.xiaozhi.me/mcp/?token=xxx2"]\n'
+            "或在 .env 中设置：MCP_ENDPOINT=wss://api.xiaozhi.me/mcp/?token=xxx",
             file=sys.stderr,
         )
         return 1
 
+    logger.info("已加载 %d 个智能体接入点", len(endpoints))
     target = sys.argv[1] if len(sys.argv) >= 2 else None
     signal_handler = mcp_pipe.signal_handler
     import signal
 
     signal.signal(signal.SIGINT, signal_handler)
     try:
-        asyncio.run(mcp_pipe.run_pipe(endpoint, target))
+        asyncio.run(mcp_pipe.run_pipes(endpoints, target))
     except KeyboardInterrupt:
         logger.info("Program interrupted by user")
     except Exception as exc:

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+import time
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
 
+from music_mcp.cache import cache_store
 from music_mcp.config import settings
 from music_mcp.local_player import player
 from music_mcp.mcp_server import MCPServer, MCPError
-from music_mcp.models import Song
+from music_mcp.models import PlayResult, Song
 from music_mcp.resource_proxy import proxy
 from music_mcp.sources import manager
 from music_mcp.utils import compact_json, truncate_text
@@ -36,11 +40,45 @@ def _song_public(song: Song) -> dict:
     return song.to_dict()
 
 
+MIN_AUDIO_BYTES = 400 * 1024  # 400 KB 以下多为试听片段或「请使用客户端」提示音
+
+
+def _fetch_total_bytes(url: str) -> Optional[int]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": settings.user_agent,
+            "Range": "bytes=0-1",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=min(4, settings.source_timeout)) as resp:
+        content_range = resp.headers.get("Content-Range", "")
+        if "/" in content_range:
+            total_part = content_range.rsplit("/", 1)[-1].strip()
+            if total_part.isdigit():
+                return int(total_part)
+        content_length = resp.headers.get("Content-Length", "").strip()
+        if resp.status == 200 and content_length.isdigit():
+            return int(content_length)
+    return None
+
+
 async def _verify_url(url: str) -> bool:
-    """快速验证播放地址可用（Range 0-1）。"""
+    """快速验证播放地址可用（Range 0-1），并过滤小于 400 KB 的提示音/试听文件。"""
     try:
-        ok = await proxy.verify_url(url)
-        return ok
+        ok = await asyncio.wait_for(proxy.verify_url(url), timeout=4.0)
+        if not ok:
+            return False
+        try:
+            total_bytes = await asyncio.wait_for(asyncio.to_thread(_fetch_total_bytes, url), timeout=4.0)
+        except Exception:
+            # 大小探测超时时放行，避免卡住整个 MCP 响应
+            return True
+        if total_bytes is not None and 0 < total_bytes < MIN_AUDIO_BYTES:
+            logger.info("跳过疑似提示音/试听小文件 (%d bytes < %d): %s", total_bytes, MIN_AUDIO_BYTES, url)
+            return False
+        return True
     except Exception as exc:
         logger.debug("播放地址验证失败 %s: %s", url, exc)
         return False
@@ -59,6 +97,32 @@ def _tool_result(
     if structured is not None:
         result["structuredContent"] = structured
     return result
+
+
+async def _cached_search(query: str, limit: int, source: Optional[str]) -> List[Song]:
+    cached = await asyncio.to_thread(cache_store.get_search, query, source, limit)
+    if cached is not None:
+        logger.debug("命中搜索缓存: %s (%d 首)", query, len(cached))
+        return cached
+    await cache_store.wait_rate_limit("search")
+    songs = await _cached_search(query, limit=limit, source=source)
+    if songs:
+        await asyncio.to_thread(cache_store.set_search, query, source, limit, songs)
+    return songs
+
+
+async def _cached_resolve(song: Song, force_refresh: bool = False) -> Tuple[PlayResult, bool]:
+    if not force_refresh and song.song_id:
+        cached = await asyncio.to_thread(cache_store.get_play_url, song.source, song.song_id)
+        if cached is not None:
+            url, mime_type = cached
+            logger.debug("命中直链缓存: %s - %s", song.title, song.source)
+            return PlayResult(url=url, mime_type=mime_type), True
+    await cache_store.wait_rate_limit(song.source)
+    play = await manager.resolve(song)
+    if play.url and song.song_id:
+        await asyncio.to_thread(cache_store.set_play_url, song.source, song.song_id, play.url, play.mime_type)
+    return play, False
 
 
 async def _search_song(args: dict) -> dict:
@@ -96,7 +160,7 @@ async def _resolve_candidates(query: str, song_id: str, source: Optional[str]) -
                 artist="",
             )
         ]
-    songs = await manager.search(query, limit=12, source=source)
+    songs = await _cached_search(query, limit=12, source=source)
     if song_id:
         matched = [s for s in songs if s.song_id == song_id]
         if matched:
@@ -131,14 +195,25 @@ async def _play_song(args: dict) -> dict:
 
     verify = True  # 本地/设备端播放前同样验证链接可用性
     last_error = "未知错误"
+    deadline = time.monotonic() + 12.0  # 防止多候选重试超时导致服务端断连
     for song in candidates[: settings.max_resolve_tries]:
+        if time.monotonic() >= deadline:
+            last_error = "解析超时，已停止继续尝试"
+            break
         try:
-            play = await manager.resolve(song)
+            play, from_cache = await _cached_resolve(song)
             if not play.url:
                 continue
             if verify and not await _verify_url(play.url):
-                last_error = f"「{song.title}」的播放地址无法访问（可能已下架或需要会员）"
-                continue
+                if from_cache and song.song_id:
+                    await asyncio.to_thread(cache_store.invalidate_play_url, song.source, song.song_id)
+                    play, _ = await _cached_resolve(song, force_refresh=True)
+                    if not play.url or not await _verify_url(play.url):
+                        last_error = f"「{song.title}」无完整可播放直链（可能已下架、VIP限制或仅返回客户端提示音）"
+                        continue
+                else:
+                    last_error = f"「{song.title}」无完整可播放直链（可能已下架、VIP限制或仅返回客户端提示音）"
+                    continue
             song_label = f"{song.title} - {song.artist}" if song.artist else song.title
             if settings.auto_play_local and player.available:
                 msg = player.play(play.url, song_label)
@@ -214,7 +289,7 @@ async def _get_play_url(args: dict) -> dict:
         return _tool_result(["未找到歌曲"], {"play_url": None})
     for song in candidates[: settings.max_resolve_tries]:
         try:
-            play = await manager.resolve(song)
+            play, _ = await _cached_resolve(song)
             if play.url:
                 return _tool_result(
                     [compact_json({"title": song.title, "artist": song.artist, "play_url": play.url})],

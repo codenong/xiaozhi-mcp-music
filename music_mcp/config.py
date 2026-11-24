@@ -55,6 +55,10 @@ class Settings:
     # 自定义聚合音乐 API（如自建的 lx-music-api-server），留空则禁用
     custom_api_base: Optional[str] = os.getenv("CUSTOM_API_BASE") or None
     cache_dir: Path = Path(os.getenv("CACHE_DIR", str(PROJECT_ROOT / "cache")))
+    # SQLite 双层缓存与限流配置：搜索默认缓存 2 天，播放直链默认缓存 15 分钟
+    search_cache_ttl: int = _int("SEARCH_CACHE_TTL", 2 * 24 * 3600)
+    play_url_cache_ttl: int = _int("PLAY_URL_CACHE_TTL", 15 * 60)
+    source_min_interval_ms: int = _int("SOURCE_MIN_INTERVAL_MS", 400)
     log_level: str = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
 
