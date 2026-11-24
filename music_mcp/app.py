@@ -105,7 +105,7 @@ async def _cached_search(query: str, limit: int, source: Optional[str]) -> List[
         logger.debug("命中搜索缓存: %s (%d 首)", query, len(cached))
         return cached
     await cache_store.wait_rate_limit("search")
-    songs = await _cached_search(query, limit=limit, source=source)
+    songs = await manager.search(query, limit=limit, source=source)
     if songs:
         await asyncio.to_thread(cache_store.set_search, query, source, limit, songs)
     return songs
@@ -133,7 +133,7 @@ async def _search_song(args: dict) -> dict:
     source = source_raw if source_raw in manager.names else None
     if not query:
         return _tool_result(["请提供搜索关键词 query"], {"songs": []}, is_error=True)
-    songs = await manager.search(query, limit=limit, source=source)
+    songs = await _cached_search(query, limit=limit, source=source)
     payload = [_song_public(s) for s in songs]
     if not payload:
         return _tool_result(
