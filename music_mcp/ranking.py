@@ -127,6 +127,13 @@ def filter_and_rank_songs(
     requested_hard = _requested_tags(q_lower, HARD_REJECT_TAGS)
     requested_soft = _expand_groups(_requested_tags(q_lower, SOFT_PENALTY_TAGS))
 
+    requested_all = requested_hard | requested_soft
+    # 去掉版本词后剩下的才是"关键词"（歌名/歌手），如「沧海一声笑 二胡」→ 沧海一声笑
+    keyword_text = q_lower
+    for tag in sorted(requested_all, key=len, reverse=True):
+        keyword_text = keyword_text.replace(tag, " ")
+    keyword_tokens = [t for t in re.split(r"[\s\-—/]+", keyword_text) if t]
+
     scored: list[tuple[float, Song]] = []
     fallback_pool: list[tuple[float, Song]] = []
 
@@ -170,10 +177,13 @@ def filter_and_rank_songs(
             elif 0 < song.duration < 60 or song.duration > 600:
                 score -= 35.0
 
-        # 用户明确要求某种版本（Live/伴奏等）时，命中该版本的歌曲优先
-        requested_all = requested_hard | requested_soft
+        # 用户明确要求某种版本（Live/伴奏等）时，命中该版本的歌曲优先；
+        # 但标题和歌手都不含任何查询关键词的歌曲（如只是专辑名带"二胡"）不吃这个加分
         if requested_all and any(tag in meta_text for tag in requested_all):
-            score += 40.0
+            if keyword_tokens and not any(tok in title_l or tok in artist_l for tok in keyword_tokens):
+                pass
+            else:
+                score += 40.0
 
         hit_soft = any(tag in meta_text and tag not in requested_soft for tag in SOFT_PENALTY_TAGS)
         if hit_soft:

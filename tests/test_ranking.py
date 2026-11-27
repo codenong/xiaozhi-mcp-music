@@ -88,3 +88,22 @@ def test_instrument_request_tolerates_generic_album_tag():
     ]
     ranked = filter_and_rank_songs(songs, "沧海一声笑 二胡")
     assert [s.song_id for s in ranked][0] == "erhu2"
+
+
+def test_version_bonus_requires_title_or_artist_keyword():
+    # 标题/歌手都与查询无关，只是专辑名带"二胡"，不应拿到版本加分而压过相关歌曲
+    songs = [
+        _make_song("豫北叙事曲", artist="王国潼", album="二胡演奏家", duration=240, source="kuwo", song_id="irrelevant"),
+        _make_song("沧海一声笑", artist="许冠杰", album="", duration=0, source="migu", song_id="relevant"),
+    ]
+    ranked = filter_and_rank_songs(songs, "沧海一声笑 二胡")
+    assert [s.song_id for s in ranked][0] == "relevant"
+
+
+def test_version_bonus_allows_artist_keyword():
+    songs = [
+        _make_song("夜曲 (钢琴版)", artist="周杰伦", album="", duration=0, source="migu", song_id="artist_hit"),
+        _make_song("无关 (钢琴版)", artist="某某", album="", duration=0, source="migu", song_id="no_hit"),
+    ]
+    ranked = filter_and_rank_songs(songs, "周杰伦 钢琴")
+    assert [s.song_id for s in ranked][0] == "artist_hit"
