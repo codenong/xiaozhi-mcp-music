@@ -86,6 +86,30 @@ async def _verify_url(url: str) -> bool:
         return False
 
 
+def _fmt_song(song: Song) -> str:
+    """单行描述一首歌，用于日志。"""
+    dur = f"{song.duration // 60}:{song.duration % 60:02d}" if song.duration else "--:--"
+    return (
+        f"{song.title} - {song.artist or '未知歌手'}"
+        f" | 专辑={song.album or '-'} | 时长={dur} | {song.source}:{song.song_id}"
+    )
+
+
+def _log_candidates(tool: str, query: str, candidates: List[Song], tries: int) -> None:
+    """打印排序后的候选歌曲列表，便于查看会按什么顺序尝试。"""
+    shown = candidates[:tries]
+    lines = [f"[{tool}] 查询「{query}」共 {len(candidates)} 个候选，将依次尝试前 {len(shown)} 个："]
+    for i, song in enumerate(shown, 1):
+        lines.append(f"  #{i} {_fmt_song(song)}")
+    if len(candidates) > len(shown):
+        lines.append(f"  ... 另有 {len(candidates) - len(shown)} 个候选不会尝试")
+    logger.info("\n".join(lines))
+
+
+def _log_selected(tool: str, rank: int, total: int, song: Song, url: str) -> None:
+    logger.info("[%s] ✔ 选中 #%d/%d：%s\n  url=%s", tool, rank, total, _fmt_song(song), truncate_text(url, 120))
+
+
 def _tool_result(
     texts: List[str],
     structured: Optional[dict] = None,
@@ -138,6 +162,8 @@ async def _search_song(args: dict) -> dict:
     fetch_limit = min(20, max(limit * 2, 16)) if source is None else limit
     raw_songs = await _cached_search(query, limit=fetch_limit, source=source)
     songs = filter_and_rank_songs(raw_songs, query)[:limit]
+    logger.info("[search_song] 原始 %d 条 → 过滤排序后 %d 条", len(raw_songs), len(songs))
+    _log_candidates("search_song", query, songs, limit)
     payload = [_song_public(s) for s in songs]
     if not payload:
         return _tool_result(
@@ -313,13 +339,17 @@ async def _play_song(args: dict) -> dict:
     verify = True  # 本地/设备端播放前同样验证链接可用性
     last_error = "未知错误"
     deadline = time.monotonic() + 12.0  # 防止多候选重试超时导致服务端断连
-    for song in candidates[: settings.max_resolve_tries]:
+    tries = candidates[: settings.max_resolve_tries]
+    _log_candidates("play_song", query or song_id, candidates, settings.max_resolve_tries)
+    for rank, song in enumerate(tries, 1):
         if time.monotonic() >= deadline:
             last_error = "解析超时，已停止继续尝试"
+            logger.info("[play_song] 解析超时，停止尝试（已试到 #%d）", rank - 1)
             break
         try:
             play, from_cache = await _cached_resolve(song)
             if not play.url:
+                logger.info("[play_song] ✘ 跳过 #%d/%d：未解析到播放地址 | %s", rank, len(tries), _fmt_song(song))
                 continue
             if verify and not await _verify_url(play.url):
                 if from_cache and song.song_id:
@@ -327,10 +357,13 @@ async def _play_song(args: dict) -> dict:
                     play, _ = await _cached_resolve(song, force_refresh=True)
                     if not play.url or not await _verify_url(play.url):
                         last_error = f"「{song.title}」无完整可播放直链（可能已下架、VIP限制或仅返回客户端提示音）"
+                        logger.info("[play_song] ✘ 跳过 #%d/%d：直链验证失败(缓存已刷新) | %s", rank, len(tries), _fmt_song(song))
                         continue
                 else:
                     last_error = f"「{song.title}」无完整可播放直链（可能已下架、VIP限制或仅返回客户端提示音）"
+                    logger.info("[play_song] ✘ 跳过 #%d/%d：直链验证失败 | %s", rank, len(tries), _fmt_song(song))
                     continue
+            _log_selected("play_song", rank, len(tries), song, play.url)
             song_label = f"{song.title} - {song.artist}" if song.artist else song.title
             if settings.auto_play_local and player.available:
                 msg = player.play(play.url, song_label)
@@ -404,16 +437,19 @@ async def _get_play_url(args: dict) -> dict:
     candidates = await _resolve_candidates(query, song_id, source)
     if not candidates:
         return _tool_result(["未找到歌曲"], {"play_url": None})
-    for song in candidates[: settings.max_resolve_tries]:
+    tries = candidates[: settings.max_resolve_tries]
+    _log_candidates("get_play_url", query or song_id, candidates, settings.max_resolve_tries)
+    for rank, song in enumerate(tries, 1):
         try:
             play, _ = await _cached_resolve(song)
             if play.url:
+                _log_selected("get_play_url", rank, len(tries), song, play.url)
                 return _tool_result(
                     [compact_json({"title": song.title, "artist": song.artist, "play_url": play.url})],
                     {"song": _song_public(song), "play_url": play.url},
                 )
         except Exception as exc:
-            logger.debug("get_play_url 失败: %s", exc)
+            logger.info("[get_play_url] ✘ 跳过 #%d/%d：%s | %s", rank, len(tries), exc, _fmt_song(song))
     return _tool_result(["未能解析到播放地址"], {"play_url": None}, is_error=True)
 
 
