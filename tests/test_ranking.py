@@ -58,3 +58,33 @@ def test_falls_back_to_live_when_no_studio_version():
     ]
     ranked = filter_and_rank_songs(songs, "某老歌")
     assert [s.song_id for s in ranked] == ["live"]
+
+
+def test_instrument_in_query_prefers_instrument_version():
+    songs = [
+        _make_song("沧海一声笑", artist="许冠杰", album="沧海一声笑", duration=175, source="netease", song_id="orig"),
+        _make_song("沧海一声笑（二胡超酷版）", artist="叶小丹", album="超好听的二胡版名曲", duration=245, source="kuwo", song_id="erhu"),
+        _make_song("沧海一声笑 (古筝版)", artist="沐九儿", album="古筝曲", duration=321, source="kuwo", song_id="guzheng"),
+    ]
+    ranked = filter_and_rank_songs(songs, "沧海一声笑 二胡")
+    ids = [s.song_id for s in ranked]
+    assert ids[0] == "erhu"
+    assert "guzheng" not in ids  # 用户要二胡，不应推荐古筝版
+
+
+def test_instrument_version_not_preferred_without_request():
+    songs = [
+        _make_song("沧海一声笑（二胡超酷版）", artist="叶小丹", album="二胡名曲", duration=245, source="kuwo", song_id="erhu"),
+        _make_song("沧海一声笑", artist="许冠杰", album="沧海一声笑", duration=175, source="netease", song_id="orig"),
+    ]
+    ranked = filter_and_rank_songs(songs, "沧海一声笑")
+    assert ranked[0].song_id == "orig"
+
+
+def test_instrument_request_tolerates_generic_album_tag():
+    songs = [
+        _make_song("沧海一声笑 (二胡)", artist="胡贰弦", album="二胡之魂|解压轻音乐", duration=257, source="netease", song_id="erhu2"),
+        _make_song("沧海一声笑", artist="许冠杰", album="沧海一声笑", duration=175, source="netease", song_id="orig"),
+    ]
+    ranked = filter_and_rank_songs(songs, "沧海一声笑 二胡")
+    assert [s.song_id for s in ranked][0] == "erhu2"

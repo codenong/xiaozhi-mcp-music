@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import time
+import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -74,8 +75,11 @@ async def _verify_url(url: str) -> bool:
             return False
         try:
             total_bytes = await asyncio.wait_for(asyncio.to_thread(_fetch_total_bytes, url), timeout=4.0)
+        except urllib.error.HTTPError as exc:
+            logger.info("播放地址返回 HTTP %s，判定不可用: %s", exc.code, url)
+            return False
         except Exception:
-            # 大小探测超时时放行，避免卡住整个 MCP 响应
+            # 大小探测超时等网络问题时放行，避免卡住整个 MCP 响应
             return True
         if total_bytes is not None and 0 < total_bytes < MIN_AUDIO_BYTES:
             logger.info("跳过疑似提示音/试听小文件 (%d bytes < %d): %s", total_bytes, MIN_AUDIO_BYTES, url)

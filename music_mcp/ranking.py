@@ -41,6 +41,20 @@ SOFT_PENALTY_TAGS: tuple[str, ...] = (
     "钢琴版",
     "吉他版",
     "纯音乐",
+    "二胡",
+    "古筝",
+    "琵琶",
+    "笛子",
+    "箫",
+    "小提琴",
+    "萨克斯",
+    "尤克里里",
+    "钢琴",
+    "吉他",
+    "器乐",
+    "乐器",
+    "轻音乐",
+    "八音盒",
     "串烧",
     "合集",
     "女声版",
@@ -55,13 +69,24 @@ SOFT_PENALTY_TAGS: tuple[str, ...] = (
 TAG_GROUPS: tuple[tuple[str, ...], ...] = (
     ("live", "现场", "演唱会"),
     ("翻唱", "cover"),
-    ("钢琴版", "吉他版", "纯音乐"),
+    ("钢琴版", "钢琴", "吉他版", "吉他"),
+    ("纯音乐", "器乐", "乐器", "轻音乐"),
     ("女声版", "男声版"),
 )
 
 
+# 具体乐器词；用户请求其中任意一个时，专辑名里的泛器乐标签（如"轻音乐"）也不应扣分
+INSTRUMENT_TAGS: tuple[str, ...] = (
+    "二胡", "古筝", "琵琶", "笛子", "箫", "小提琴", "萨克斯", "尤克里里",
+    "钢琴", "吉他", "钢琴版", "吉他版",
+)
+GENERIC_INSTRUMENTAL_TAGS: tuple[str, ...] = ("纯音乐", "器乐", "乐器", "轻音乐", "八音盒")
+
+
 def _expand_groups(requested: set[str]) -> set[str]:
     expanded = set(requested)
+    if requested.intersection(INSTRUMENT_TAGS):
+        expanded.update(GENERIC_INSTRUMENTAL_TAGS)
     for group in TAG_GROUPS:
         if requested.intersection(group):
             expanded.update(group)

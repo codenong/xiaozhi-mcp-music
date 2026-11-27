@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import List
+from urllib.parse import urlparse
 
 import httpx
 
@@ -94,6 +95,9 @@ class NeteaseSource(MusicSource):
         if resp.status_code in (301, 302, 303, 307, 308):
             location = resp.headers.get("location") or resp.headers.get("Location")
             if location:
+                # 歌曲不可用（VIP/无版权/下架）时，外链接口会 302 到 music.163.com/404
+                if urlparse(location).path.rstrip("/").endswith("/404"):
+                    raise SourceError("网易云该歌曲不可用（外链重定向到 404，可能为 VIP/无版权/下架）")
                 return PlayResult(url=location, mime_type="audio/mpeg", note="网易云外链")
         if resp.status_code == 200 and resp.content:
             # 部分接口直接返回音频内容或最终地址

@@ -110,7 +110,12 @@ class ResourceProxy:
             return False
         try:
             resp = await self._client.get(url, headers={"Range": "bytes=0-1"})
-            return resp.status_code in (200, 206)
+            if resp.status_code not in (200, 206):
+                return False
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if ctype.startswith("text/") or "json" in ctype or "html" in ctype:
+                return False  # 返回的是网页/错误信息，不是音频
+            return True
         except Exception:
             return False
 
