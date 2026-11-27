@@ -46,7 +46,7 @@ class Settings:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     )
     # 播放地址解析时的候选尝试次数（含失败自动换下一首）
-    max_resolve_tries: int = _int("MAX_RESOLVE_TRIES", 6)
+    max_resolve_tries: int = _int("MAX_RESOLVE_TRIES", 8)
     # resource/read 分页大小上限（字节）
     max_page_size: int = _int("MAX_PAGE_SIZE", 1024 * 1024)
     # 本地播放器：none / mpv / vlc

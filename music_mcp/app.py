@@ -159,7 +159,8 @@ async def _search_song(args: dict) -> dict:
     source = source_raw if source_raw in manager.names else None
     if not query:
         return _tool_result(["请提供搜索关键词 query"], {"songs": []}, is_error=True)
-    fetch_limit = min(20, max(limit * 2, 16)) if source is None else limit
+    # 多抓一些：auto 时每个音源约取 6~10 条，过滤掉 DJ/伴奏等之后仍有足够候选
+    fetch_limit = min(40, max(limit * 4, 24)) if source is None else min(20, max(limit * 2, 10))
     raw_songs = await _cached_search(query, limit=fetch_limit, source=source)
     songs = filter_and_rank_songs(raw_songs, query)[:limit]
     logger.info("[search_song] 原始 %d 条 → 过滤排序后 %d 条", len(raw_songs), len(songs))
@@ -303,7 +304,7 @@ async def _resolve_candidates(query: str, song_id: str, source: Optional[str]) -
                 artist="",
             )
         ]
-    songs = await _cached_search(query, limit=20, source=source)
+    songs = await _cached_search(query, limit=32, source=source)
     if song_id:
         matched = [s for s in songs if s.song_id == song_id]
         if matched:
