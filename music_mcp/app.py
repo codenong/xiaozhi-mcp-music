@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,6 +14,7 @@ from music_mcp.config import settings
 from music_mcp.local_player import player
 from music_mcp.mcp_server import MCPServer, MCPError
 from music_mcp.models import PlayResult, Song
+from music_mcp.ranking import filter_and_rank_songs
 from music_mcp.resource_proxy import proxy
 from music_mcp.sources import manager
 from music_mcp.utils import compact_json, truncate_text
@@ -133,7 +135,9 @@ async def _search_song(args: dict) -> dict:
     source = source_raw if source_raw in manager.names else None
     if not query:
         return _tool_result(["请提供搜索关键词 query"], {"songs": []}, is_error=True)
-    songs = await _cached_search(query, limit=limit, source=source)
+    fetch_limit = min(20, max(limit * 2, 16)) if source is None else limit
+    raw_songs = await _cached_search(query, limit=fetch_limit, source=source)
+    songs = filter_and_rank_songs(raw_songs, query)[:limit]
     payload = [_song_public(s) for s in songs]
     if not payload:
         return _tool_result(
@@ -147,8 +151,121 @@ async def _search_song(args: dict) -> dict:
     return _tool_result([summary, text], {"songs": payload})
 
 
+_TIER2_KEYWORDS = ("live", "现场", "演唱会", "合唱", "原声", "ost", "片尾曲", "主题曲", "插曲")
+_TIER3_KEYWORDS = (
+    "翻唱", "cover", "dj", "慢摇", "remix", "电音", "舞曲",
+    "女声版", "男声版", "女生版", "男生版", "抖音", "网红", "热播",
+    "加速", "降调", "升调", "0.8x", "1.2x", "改编", "戏腔版", "粤语版",
+)
+_TIER4_KEYWORDS = (
+    "伴奏", "消音", "卡拉ok", "ktv", "纯音乐", "乐器", "曲子",
+    "钢琴", "琵琶", "古筝", "二胡", "笛子", "箫", "吉他", "小提琴",
+    "萨克斯", "尤克里里", "八音盒", "铃声", "高潮版", "片段", "试听",
+)
+_ALL_VERSION_KEYWORDS = _TIER2_KEYWORDS + _TIER3_KEYWORDS + _TIER4_KEYWORDS
+
+
+_QUERY_FILLER_WORDS = {
+    "原版", "原唱", "完整版", "完整", "高清", "无损", "正版", "歌曲", "音乐", "一首",
+}
+
+
+def _strip_brackets(text: str) -> str:
+    return re.sub(r"[（(【\[][^）)】\]]*[）)】\]]", "", text).strip()
+
+
+def _filter_relevant(query: str, songs: List[Song]) -> List[Song]:
+    """过滤明显跑题的搜索结果（如搜「周杰伦 晴天」时返回「布拉格广场 - 周杰伦」）。"""
+    q = (query or "").strip()
+    if not q or not songs:
+        return songs
+
+    raw_parts = [part.strip().lower() for part in re.split(r"[\s\-—·/、,，]+", q) if part.strip()]
+    core_parts = [part for part in raw_parts if part not in _QUERY_FILLER_WORDS] or raw_parts
+
+    matched: List[Song] = []
+    for song in songs:
+        title_lower = (song.title or "").strip().lower()
+        artist_lower = (song.artist or "").strip().lower()
+        combined = f"{title_lower} {artist_lower}"
+
+        if not all(part in combined for part in core_parts):
+            continue
+
+        if len(core_parts) >= 2:
+            non_artist_parts = [
+                part for part in core_parts
+                if part not in artist_lower and part not in _ALL_VERSION_KEYWORDS
+            ]
+            if non_artist_parts and not all(part in title_lower for part in non_artist_parts):
+                continue
+
+        matched.append(song)
+    return matched
+
+
+def _rank_candidates(query: str, songs: List[Song]) -> List[Song]:
+    """未指定版本时优先原版，原版不可用时自动降级到 Live/翻唱/DJ/器乐。"""
+    if len(songs) <= 1:
+        return songs
+
+    q_lower = query.strip().lower()
+    q_parts = [p for p in re.split(r"\s+", q_lower) if p]
+    requested_versions = [kw for kw in _ALL_VERSION_KEYWORDS if kw in q_lower]
+
+    def score_song(indexed_song: Tuple[int, Song]) -> Tuple[int, int]:
+        idx, song = indexed_song
+        title_lower = (song.title or "").strip().lower()
+        artist_lower = (song.artist or "").strip().lower()
+        combined = f"{title_lower} {artist_lower}"
+        clean_title = _strip_brackets(title_lower)
+
+        # 如果用户明确指定了版本词（例如 "青花瓷 钢琴" 或 "dj"）
+        if requested_versions:
+            matched_req = any(kw in combined for kw in requested_versions)
+            tier = 0 if matched_req else 3
+            return (tier, idx)
+
+        # 判断非原版梯队
+        if any(kw in combined for kw in _TIER4_KEYWORDS):
+            tier = 40
+        elif any(kw in combined for kw in _TIER3_KEYWORDS):
+            tier = 30
+        elif any(kw in combined for kw in _TIER2_KEYWORDS):
+            tier = 20
+        else:
+            tier = 0
+
+        # 过短音频（疑似铃声/片段）降权
+        duration = getattr(song, "duration", 0) or 0
+        if 0 < duration < 60:
+            tier += 35
+
+        # 标题干净度与匹配度微调（仅在同一大梯队内比较）
+        clean_q = q_lower
+        for part in q_parts:
+            if part and part in artist_lower and len(q_parts) > 1:
+                clean_q = clean_q.replace(part, "").strip()
+        if clean_title == clean_q or title_lower == clean_q:
+            tier -= 4
+        elif clean_q and clean_q in clean_title:
+            tier -= 2
+
+        # 如果 query 中带了歌手名且命中歌手，优先度提升
+        if len(q_parts) >= 2 and any(p in artist_lower for p in q_parts):
+            tier -= 3
+
+        # 标题包含括号修饰（如 "(xxx版)"）轻微后置
+        if title_lower != clean_title:
+            tier += 1
+
+        return (tier, idx)
+
+    return [s for _, s in sorted(enumerate(songs), key=score_song)]
+
+
 async def _resolve_candidates(query: str, song_id: str, source: Optional[str]) -> List[Song]:
-    """根据参数构造候选歌曲列表。"""
+    """根据参数构造候选歌曲列表（支持原版优先排序）。"""
     if song_id and source:
         src = manager.get(source)
         return [
@@ -160,12 +277,12 @@ async def _resolve_candidates(query: str, song_id: str, source: Optional[str]) -
                 artist="",
             )
         ]
-    songs = await _cached_search(query, limit=12, source=source)
+    songs = await _cached_search(query, limit=20, source=source)
     if song_id:
         matched = [s for s in songs if s.song_id == song_id]
         if matched:
             return matched
-    return songs
+    return filter_and_rank_songs(songs, query)
 
 
 async def _play_song(args: dict) -> dict:
