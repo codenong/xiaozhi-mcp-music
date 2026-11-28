@@ -15,7 +15,8 @@ from music_mcp.config import settings
 from music_mcp.local_player import player
 from music_mcp.mcp_server import MCPServer, MCPError
 from music_mcp.models import PlayResult, Song
-from music_mcp.ranking import filter_and_rank_songs
+from music_mcp.original_artist import lookup_original_artist
+from music_mcp.ranking import filter_and_rank_songs, song_matches_artist
 from music_mcp.resource_proxy import proxy
 from music_mcp.sources import manager
 from music_mcp.utils import compact_json, truncate_text
@@ -295,30 +296,90 @@ def _rank_candidates(query: str, songs: List[Song]) -> List[Song]:
     return [s for _, s in sorted(enumerate(songs), key=score_song)]
 
 
-async def _resolve_candidates(query: str, song_id: str, source: Optional[str]) -> List[Song]:
-    """根据参数构造候选歌曲列表（支持原版优先排序）。"""
+def _merge_unique_songs(*groups: List[Song]) -> List[Song]:
+    seen = set()
+    merged: List[Song] = []
+    for grp in groups:
+        for s in grp:
+            key = (s.source, s.song_id or f"{s.title}:{s.artist}")
+            if key not in seen:
+                seen.add(key)
+                merged.append(s)
+    return merged
+
+
+async def _resolve_candidates(
+    query: str,
+    song_id: str,
+    source: Optional[str],
+    artist: str = "",
+    version: str = "",
+    allow_cover: bool = False,
+) -> Tuple[List[Song], str, bool]:
+    """根据参数构造候选歌曲列表；返回 (candidates, target_artist, strict_artist)。"""
     if song_id and source:
         src = manager.get(source)
-        return [
-            Song(
-                source=source,
-                source_name=src.display_name if src else source,
-                song_id=song_id,
-                title=query or song_id,
-                artist="",
-            )
-        ]
-    songs = await _cached_search(query, limit=32, source=source)
+        return (
+            [
+                Song(
+                    source=source,
+                    source_name=src.display_name if src else source,
+                    song_id=song_id,
+                    title=query or song_id,
+                    artist=artist,
+                )
+            ],
+            artist,
+            False,
+        )
+
+    target_artist = artist.strip()
+    target_version = version.strip()
+
+    # 仅在用户未指定歌手和版本时，静默识别原唱歌手
+    if not target_artist and not target_version and not allow_cover and query:
+        # 若 query 中明显只有纯歌名（无空格且不含版本词），静默查询原唱
+        if " " not in query.strip():
+            found_artist = await lookup_original_artist(query)
+            if found_artist:
+                target_artist = found_artist
+
+    search_terms = []
+    if target_artist or target_version:
+        combined_q = " ".join(p for p in (target_artist, query, target_version) if p).strip()
+        search_terms.append(combined_q)
+        if query and query != combined_q:
+            search_terms.append(query)
+    else:
+        search_terms.append(query)
+
+    results = await asyncio.gather(
+        *(_cached_search(q, limit=32, source=source) for q in search_terms)
+    )
+    songs = _merge_unique_songs(*results)
+
     if song_id:
         matched = [s for s in songs if s.song_id == song_id]
         if matched:
-            return matched
-    return filter_and_rank_songs(songs, query)
+            return matched, target_artist, False
+
+    ranked = filter_and_rank_songs(
+        songs,
+        query,
+        allow_fallback=bool(allow_cover or target_version),
+        target_artist=target_artist,
+        target_version=target_version,
+    )
+    strict_artist = bool(target_artist and not allow_cover and not target_version)
+    return ranked, target_artist, strict_artist
 
 
 async def _play_song(args: dict) -> dict:
     query = str(args.get("query", "") or "").strip()
     song_id = str(args.get("song_id", "") or "").strip()
+    artist = str(args.get("artist", "") or "").strip()
+    version = str(args.get("version", "") or "").strip()
+    allow_cover = bool(args.get("allow_cover", False))
     source_raw = str(args.get("source", "auto") or "auto").strip()
     source = source_raw if source_raw in manager.names else None
 
@@ -330,7 +391,9 @@ async def _play_song(args: dict) -> dict:
         )
 
     try:
-        candidates = await _resolve_candidates(query, song_id, source)
+        candidates, target_artist, strict_artist = await _resolve_candidates(
+            query, song_id, source, artist=artist, version=version, allow_cover=allow_cover
+        )
     except Exception as exc:
         logger.exception("搜索歌曲失败")
         return _tool_result([f"搜索失败: {exc}"], {"playing": False}, is_error=True)
@@ -340,6 +403,21 @@ async def _play_song(args: dict) -> dict:
             [f"没有找到「{query or song_id}」对应的歌曲，请换一个说法或歌名。"],
             {"playing": False},
         )
+
+    other_candidates: List[Song] = []
+    if strict_artist and target_artist:
+        matched_artist = [s for s in candidates if song_matches_artist(s, target_artist)]
+        other_candidates = [s for s in candidates if not song_matches_artist(s, target_artist)]
+        if matched_artist:
+            candidates = matched_artist
+        else:
+            alt_desc = "、".join(
+                f"{s.title}({s.artist or '未知'})" for s in other_candidates[:3]
+            )
+            msg = f"已确认《{query}》原唱/目标歌手为 {target_artist}，但未找到该歌手的可播版本。"
+            if alt_desc:
+                msg += f"当前搜到其他版本：{alt_desc}。请询问用户是否改播翻唱或其他版本（同意后再传 allow_cover=true）。"
+            return _tool_result([msg], {"playing": False, "original_artist": target_artist, "need_cover_confirm": True})
 
     verify = True  # 本地/设备端播放前同样验证链接可用性
     last_error = "未知错误"
@@ -422,6 +500,20 @@ async def _play_song(args: dict) -> dict:
             last_error = str(exc)
             logger.warning("解析 %s 播放地址失败: %s", song.title, exc)
 
+    if strict_artist and target_artist:
+        alt_desc = "、".join(
+            f"{s.title}({s.artist or '未知'})" for s in other_candidates[:3]
+        )
+        msg = f"《{query or song_id}》的原唱/目标歌手（{target_artist}）在各音源均暂无免费可播直链（{last_error}）。"
+        if alt_desc:
+            msg += f"目前有其他翻唱/演奏版本（{alt_desc}），请询问用户是否改播翻唱版（用户同意后传入 allow_cover=true 再调用 play_song）。"
+        else:
+            msg += "请告知用户原唱暂无免费音源，可换一首歌或询问是否尝试翻唱版本。"
+        return _tool_result(
+            [msg],
+            {"playing": False, "original_artist": target_artist, "need_cover_confirm": True, "reason": last_error},
+        )
+
     return _tool_result(
         [
             f"无法播放「{query or song_id}」：{last_error}。"
@@ -439,7 +531,7 @@ async def _get_play_url(args: dict) -> dict:
     source = source_raw if source_raw in manager.names else None
     if not query and not song_id:
         return _tool_result(["需要 query 或 song_id"], {"play_url": None}, is_error=True)
-    candidates = await _resolve_candidates(query, song_id, source)
+    candidates, _, _ = await _resolve_candidates(query, song_id, source)
     if not candidates:
         return _tool_result(["未找到歌曲"], {"play_url": None})
     tries = candidates[: settings.max_resolve_tries]
@@ -527,7 +619,10 @@ def build_server() -> MCPServer:
         {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "歌曲名，或 歌手 + 歌名，例如：青花瓷"},
+                "query": {"type": "string", "description": "纯歌名（如：凡人歌），或歌名关键词"},
+                "artist": {"type": "string", "description": "可选：歌手或演奏者。用户明确指定时必填；未指定时仅在100%确定原唱时填写，否则留空由后台自动识别原唱"},
+                "version": {"type": "string", "description": "可选：用户明确指定的版本或乐器，如 钢琴演奏、DJ、Live；用户未提及则留空"},
+                "allow_cover": {"type": "boolean", "description": "可选：是否允许在原唱无免费源时播放翻唱/其他版本，默认 false；仅在用户明确同意听翻唱时传 true"},
                 "song_id": {"type": "string", "description": "search_song 返回的歌曲 ID（可选）"},
                 "source": {
                     "type": "string",

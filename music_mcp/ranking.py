@@ -110,18 +110,35 @@ def _requested_tags(query_lower: str, tags: Iterable[str]) -> set[str]:
     return {tag for tag in tags if tag in query_lower}
 
 
+def song_matches_artist(song: Song, target_artist: str) -> bool:
+    """判断歌曲歌手是否命中目标歌手（支持多歌手分隔与括号英文名）。"""
+    t = (target_artist or "").strip().lower()
+    a = (song.artist or "").strip().lower()
+    if not t or not a:
+        return False
+    if t in a or a in t:
+        return True
+    t_parts = [p for p in re.split(r"[\s/、,&，]+", t) if len(p) >= 2]
+    return bool(t_parts and any(p in a for p in t_parts))
+
+
 def filter_and_rank_songs(
     songs: list[Song],
     query: str,
     allow_fallback: bool = True,
+    target_artist: str = "",
+    target_version: str = "",
 ) -> list[Song]:
     """根据查询意图过滤低质量/非原版结果并跨音源重排。"""
     if not songs:
         return []
 
-    q_lower = query.lower().strip()
+    effective_q = f"{query} {target_artist} {target_version}".strip()
+    q_lower = effective_q.lower()
     if not q_lower:
         return list(songs)
+    core_query_lower = (query or "").lower().strip()
+    target_version_l = (target_version or "").strip().lower()
 
     tokens = [t for t in re.split(r"[\s\-—/]+", q_lower) if t]
     requested_hard = _requested_tags(q_lower, HARD_REJECT_TAGS)
@@ -150,21 +167,31 @@ def filter_and_rank_songs(
 
         core_title = _extract_core_title(song.title or "")
         if core_title:
-            if core_title == q_lower:
+            if core_title == core_query_lower or core_title == q_lower:
                 score += 55.0
-            elif core_title in q_lower or q_lower in core_title:
+            elif core_title in q_lower or (core_query_lower and core_query_lower in core_title):
                 score += 38.0
             elif any(tok in core_title for tok in tokens):
                 score += 15.0
 
         # 标题包含括号修饰但用户未要求特殊版本时轻微扣分
-        if title_l != core_title and not (requested_hard or requested_soft):
+        if title_l != core_title and not (requested_hard or requested_soft or target_version_l):
             score -= 6.0
 
-        # 歌手匹配加分（如 "周杰伦 晴天"）
-        artist_tokens = [tok for tok in tokens if tok not in core_title]
-        if artist_tokens and any(tok in artist_l for tok in artist_tokens):
-            score += 30.0
+        # 明确目标歌手强锁定（用户指定或 MCP 静默查到的原唱）
+        if target_artist:
+            if song_matches_artist(song, target_artist):
+                score += 60.0
+            else:
+                score -= 60.0
+        else:
+            artist_tokens = [tok for tok in tokens if tok not in core_title]
+            if artist_tokens and any(tok in artist_l for tok in artist_tokens):
+                score += 30.0
+
+        # 用户指定版本词额外加分（如 "钢琴演奏" / "Live" / "DJ"）
+        if target_version_l and (target_version_l in meta_text or target_version_l in artist_l):
+            score += 45.0
 
         # 正式专辑加分
         if (song.album or "").strip():
