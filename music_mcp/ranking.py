@@ -120,13 +120,21 @@ def _artist_parts(artist: str) -> list[str]:
     return [p.strip().lower() for p in re.split(r"[/、,&]+", cleaned) if p.strip()]
 
 
+def _artist_part_equals(part: str, target: str) -> bool:
+    if part == target:
+        return True
+    # 中文名防前缀误匹配（如 "王菲" 不应命中 "王菲菲" / "王菲儿"）
+    pat = rf"(?<![\u4e00-\u9fffa-z0-9]){re.escape(target)}(?![\u4e00-\u9fffa-z0-9])"
+    return bool(re.search(pat, part))
+
+
 def song_is_exact_artist(song: Song, target_artist: str) -> bool:
     """判断歌曲歌手是否为纯粹的目标原唱（非主播拼盘/合唱蹭名）。"""
     t = (target_artist or "").strip().lower()
     if not t:
         return False
     parts = _artist_parts(song.artist or "")
-    return len(parts) == 1 and (parts[0] == t or t in parts[0] or parts[0] in t)
+    return len(parts) == 1 and _artist_part_equals(parts[0], t)
 
 
 def song_matches_artist(song: Song, target_artist: str) -> bool:
@@ -138,10 +146,10 @@ def song_matches_artist(song: Song, target_artist: str) -> bool:
     if any(bad in a for bad in ("直播", "弹唱", "翻唱", "cover", "dj", "播客", "电台")):
         return False
     parts = _artist_parts(song.artist or "")
-    if any(p == t or t in p or p in t for p in parts):
+    if any(_artist_part_equals(p, t) for p in parts):
         return True
     t_parts = [p for p in re.split(r"[\s/、,&，]+", t) if len(p) >= 2]
-    return bool(t_parts and any(p in a for p in t_parts))
+    return bool(t_parts and any(_artist_part_equals(p, tp) for p in parts for tp in t_parts))
 
 
 def filter_and_rank_songs(
@@ -184,6 +192,12 @@ def filter_and_rank_songs(
 
         if any(tag in meta_text and tag not in requested_hard for tag in HARD_REJECT_TAGS):
             continue
+
+        # 过滤歌名完全不相关的干扰项（例如搜 "王菲 如愿" 时混入的 "人间 - 王菲"）
+        if core_query_lower and core_query_lower not in title_l:
+            q_toks = [t for t in re.split(r"[\s\-—/]+", core_query_lower) if t and t != (target_artist or "").strip().lower()]
+            if q_toks and not all(tok in title_l for tok in q_toks):
+                continue
 
         score = SOURCE_WEIGHTS.get(song.source, 0.0)
 
