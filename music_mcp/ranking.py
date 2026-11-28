@@ -30,6 +30,11 @@ HARD_REJECT_TAGS: tuple[str, ...] = (
     "喊麦",
     "ai翻唱",
     "鬼畜",
+    "直播",
+    "弹唱",
+    "播客",
+    "电台",
+    "翻唱主播",
 )
 
 SOFT_PENALTY_TAGS: tuple[str, ...] = (
@@ -110,13 +115,30 @@ def _requested_tags(query_lower: str, tags: Iterable[str]) -> set[str]:
     return {tag for tag in tags if tag in query_lower}
 
 
+def _artist_parts(artist: str) -> list[str]:
+    cleaned = re.sub(r"[\(\[（【].*?[\)\]）】]", "", artist or "")
+    return [p.strip().lower() for p in re.split(r"[/、,&]+", cleaned) if p.strip()]
+
+
+def song_is_exact_artist(song: Song, target_artist: str) -> bool:
+    """判断歌曲歌手是否为纯粹的目标原唱（非主播拼盘/合唱蹭名）。"""
+    t = (target_artist or "").strip().lower()
+    if not t:
+        return False
+    parts = _artist_parts(song.artist or "")
+    return len(parts) == 1 and (parts[0] == t or t in parts[0] or parts[0] in t)
+
+
 def song_matches_artist(song: Song, target_artist: str) -> bool:
-    """判断歌曲歌手是否命中目标歌手（支持多歌手分隔与括号英文名）。"""
+    """判断歌曲歌手是否命中目标歌手（过滤含直播/弹唱等杂质歌手名）。"""
     t = (target_artist or "").strip().lower()
     a = (song.artist or "").strip().lower()
     if not t or not a:
         return False
-    if t in a or a in t:
+    if any(bad in a for bad in ("直播", "弹唱", "翻唱", "cover", "dj", "播客", "电台")):
+        return False
+    parts = _artist_parts(song.artist or "")
+    if any(p == t or t in p or p in t for p in parts):
         return True
     t_parts = [p for p in re.split(r"[\s/、,&，]+", t) if len(p) >= 2]
     return bool(t_parts and any(p in a for p in t_parts))
@@ -158,7 +180,7 @@ def filter_and_rank_songs(
         title_l = (song.title or "").lower()
         artist_l = (song.artist or "").lower()
         album_l = (song.album or "").lower()
-        meta_text = f"{title_l} {album_l}"
+        meta_text = f"{title_l} {album_l} {artist_l}"
 
         if any(tag in meta_text and tag not in requested_hard for tag in HARD_REJECT_TAGS):
             continue
@@ -180,8 +202,10 @@ def filter_and_rank_songs(
 
         # 明确目标歌手强锁定（用户指定或 MCP 静默查到的原唱）
         if target_artist:
-            if song_matches_artist(song, target_artist):
-                score += 60.0
+            if song_is_exact_artist(song, target_artist):
+                score += 80.0
+            elif song_matches_artist(song, target_artist):
+                score += 20.0
             else:
                 score -= 60.0
         else:

@@ -422,8 +422,9 @@ async def _play_song(args: dict) -> dict:
     verify = True  # 本地/设备端播放前同样验证链接可用性
     last_error = "未知错误"
     deadline = time.monotonic() + 12.0  # 防止多候选重试超时导致服务端断连
-    tries = candidates[: settings.max_resolve_tries]
-    _log_candidates("play_song", query or song_id, candidates, settings.max_resolve_tries)
+    max_tries = max(settings.max_resolve_tries, 10)
+    tries = candidates[:max_tries]
+    _log_candidates("play_song", query or song_id, candidates, max_tries)
     for rank, song in enumerate(tries, 1):
         if time.monotonic() >= deadline:
             last_error = "解析超时，已停止继续尝试"
