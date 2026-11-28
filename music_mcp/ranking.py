@@ -221,11 +221,15 @@ def filter_and_rank_songs(
         if (song.album or "").strip():
             score += 5.0
 
-        # 时长合理性校验
-        if song.duration is not None:
-            if 90 <= song.duration <= 420:
+        # 时长合理性校验：优先 3~6 分钟完整曲目，1.5~2.5 分钟多为抖音/剪辑残缺版
+        if song.duration is not None and song.duration > 0:
+            if 180 <= song.duration <= 360:
+                score += 18.0
+            elif (150 <= song.duration < 180) or (360 < song.duration <= 420):
                 score += 10.0
-            elif 0 < song.duration < 60 or song.duration > 600:
+            elif 90 <= song.duration < 150:
+                score -= 12.0
+            elif song.duration < 90 or song.duration > 600:
                 score -= 35.0
 
         # 用户明确要求某种版本（Live/伴奏等）时，命中该版本的歌曲优先；
